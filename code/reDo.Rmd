@@ -1,0 +1,687 @@
+---
+title: "DataPrep"
+author: "Kaz"
+date: "11/19/2020"
+output: 
+    html_document:
+        toc: yes
+        toc_float:
+            collapsed: no
+            smooth_scoll: yes
+        number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+root <- rprojroot::find_rstudio_root_file()
+dataDir <- file.path(root, 'data')
+shapeDir <- file.path(root, 'shape')
+library(dplyr)
+library(readxl)
+library(purrr)
+library(sf)
+library(readr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(tmap)
+```
+
+## Loading Data
+
+```{r}
+wf <- st_read(file.path(shapeDir, "wholeFoods"))
+wfHarlem <- wf %>% filter(store == "Whole Foods Harlem") %>% st_transform(2263)
+wfHarlemBufferHalf <- wfHarlem %>% st_buffer(2640)
+wfHarlemBufferOne <- wfHarlem %>% st_buffer(2640*2)
+
+```
+
+```{r}
+pluto <- st_read(file.path(shapeDir, "PLUTO_Dissolve")) %>% filter(Borough == "MN")
+```
+
+```{r}
+tm_shape(pluto, bbox = st_bbox(wfHarlemBufferOne)) +
+    tm_polygons() +
+    tm_shape(wfHarlemBufferHalf) +
+    tm_borders() +
+    tm_shape(wfHarlemBufferOne) +
+    tm_borders() +
+    tm_shape(wfHarlem) +
+    tm_symbols()
+```
+
+```{r}
+plutoWF <- pluto %>% filter(st_intersects(pluto, wfHarlemBufferOne,sparse = FALSE)) %>% 
+    select(BoroName, Block) %>% 
+    group_by(Block) %>% 
+    summarize(BoroName = first(BoroName)) %>% 
+    st_cast() %>% 
+    ungroup()
+plutoWF <- plutoWF %>% 
+    filter(!Block %in% c(1111, 1897)) %>% 
+    sf::st_join(wfHarlemBufferHalf %>%mutate(buffer = "Half"),join =st_within) %>%  
+    dplyr::mutate(buffer = if_else(is.na(buffer), "Mile", buffer))
+
+tm_shape(plutoWF) + 
+    tm_polygons(col = "buffer")
+```
+
+## Permits
+
+```{r}
+permits <- read_csv(file.path(dataDir, "DOB_Permit_Issuance2010_2020.csv"))
+
+permits <- permits %>% 
+    janitor::clean_names()%>% 
+    select(borough, job_type,
+           block, lot, permit_type,
+           filing_date, latitude, longitude)
+
+permits <- permits %>% 
+    mutate(filing_date = lubridate::mdy_hms(filing_date),
+           year = lubridate::year(filing_date),
+           month = lubridate::month(filing_date))
+
+permitsMN <- permits %>% filter(borough == "MANHATTAN")
+rm(permits)
+
+permitsWF <- permitsMN %>% mutate(Block = as.numeric(block)) %>% 
+                         left_join(plutoWF %>% st_drop_geometry()) %>% 
+    filter(!is.na(buffer))
+```
+
+```{r}
+permitsWF %>% 
+    group_by( month, year, buffer) %>% 
+    summarize(date = min(filing_date),
+              count = n()) %>% 
+    ggplot(aes(date, count)) +
+    geom_point(aes(color = buffer)) +
+    geom_smooth(aes(color = buffer)) + 
+    #facet_wrap(~buffer) +
+    theme(legend.position = "none")
+```
+
+
+## Sales
+
+```{r}
+sales <- read_csv(file.path(dataDir, "rollingSales","nycSales_2010_2019"))
+
+mnSales <- sales %>% filter(BOROUGH == 1) %>% janitor:::clean_names()
+rm(sales)
+```
+
+```{r}
+# mnSalesJoin <- plutoWF %>%     
+#     janitor:::clean_names() %>% 
+#     left_join(mnSales, by = c("block" = "block")) %>% 
+#     tidyr::separate(address,  c("address","aptNum"), ",") %>% 
+#     mutate(BL = paste0(block, stringr::str_pad(lot, 4,side = "left", pad = "0")),
+#            bbl = paste0(1, stringr::str_pad(block, 5,side = "left", pad = "0"), stringr::str_pad(lot, 4,side = "left", pad = "0")),
+#           aptNum = if_else(is.na(apartment_number), aptNum, apartment_number),
+#           time = factor(if_else(sale_date < ymd("2017-01-01"), "Before WF", "After WF"), levels = c("Before WF", "After WF")))
+```
+
+```{r}
+# library(geoclient)
+# 
+# mnSalesJoin <- mnSalesJoin %>% filter(nchar(bbl) == 10) %>% 
+#     mutate(bbl_use = geo_bbl(bbl)[["bbl"]])
+```
+```{r}
+mnSalesJoin <- readr::read_csv(file.path(dataDir, "mnSalesJoin.csv"))
+```
+
+## average change
+```{r}
+mnSalesSummary <- mnSalesJoin %>% 
+    #st_drop_geometry() %>% 
+    filter(sale_price > 50000) %>% 
+    mutate(month = month(sale_date),
+           year = year(sale_date)) %>% 
+    group_by(year, buffer) %>% 
+    summarize(meanSale = mean(sale_price),
+              medSale = median(sale_price),
+              count = n())
+```
+# average sale price
+```{r}
+mnSalesSummary %>% 
+    ggplot(aes(year, meanSale)) +
+    geom_point(aes(color = buffer)) +
+    geom_smooth(aes(color = buffer)) 
+    #facet_wrap(~buffer) +
+```
+
+
+```{r}
+mnSalesSummary %>% 
+    ggplot(aes(year, medSale)) +
+    geom_point(aes(color = buffer)) +
+    geom_smooth(aes(color = buffer)) 
+```
+
+```{r}
+mnSalesSummary %>% 
+    ggplot(aes(year, count)) +
+    geom_point(aes(color = buffer)) +
+    geom_smooth(aes(color = buffer)) 
+```
+
+## Repeat sales
+
+```{r}
+repeatLots <- mnSalesJoin %>% 
+    #st_drop_geometry() %>% 
+    filter(sale_price > 50000) %>% 
+    group_by(BL, address, aptNum) %>% count() %>% 
+    filter(n > 1) %>% 
+    pull(BL)
+
+mnSalesRepeat <- mnSalesJoin %>% filter(BL %in% repeatLots) %>% 
+    arrange(BL)
+```
+
+```{r}
+mnSalesRepeat %>% 
+    #st_drop_geometry() %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price)) %>% 
+    ungroup() %>% 
+    filter(last < 10000000, last > 50000) %>% 
+    ggplot(aes(time, last)) +
+    geom_point(aes(group = BL, color = time)) +
+    geom_line(aes(group = BL), alpha = .2) +
+    facet_wrap(~buffer) + 
+    theme_minimal()
+```
+
+
+```{r}
+mnSalesRepeat %>% 
+    #st_drop_geometry() %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present)) %>% 
+    ungroup() %>% 
+    filter(last < 10000000, last > 50000, class == "R4") %>% 
+    ggplot(aes(time, last)) +
+    geom_point(aes(group = BL, color = time)) +
+    geom_line(aes(group = BL), alpha = .2) +
+    facet_wrap(~buffer) + 
+    theme_minimal()
+```
+
+## Avg chanage R4
+```{r}
+mnSalesRepeat %>% 
+    #st_drop_geometry() %>% 
+    filter(building_class_at_present == "R4") %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present)) %>% 
+    ungroup() %>% 
+    group_by(buffer,time) %>% 
+    summarize(avgPrice = mean(last),
+              medPrice = median(last)) %>% 
+    ggplot(aes(time, avgPrice)) +
+    geom_point(aes(group = buffer, color = buffer)) +
+    geom_line(aes(group = buffer), alpha = .2) +
+    theme_minimal()
+```
+## Median change R4
+```{r}
+mnSalesRepeat %>% 
+   # st_drop_geometry() %>% 
+    filter(building_class_at_present == "R4") %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present)) %>% 
+    ungroup() %>% 
+    group_by(buffer,time) %>% 
+    summarize(avgPrice = mean(last),
+              medPrice = median(last)) %>% 
+    ggplot(aes(time, medPrice)) +
+    geom_point(aes(group = buffer, color = buffer)) +
+    geom_line(aes(group = buffer), alpha = .2) +
+    theme_minimal()
+```
+## map
+```{r}
+changeDF <- mnSalesJoin %>%
+    mutate(wfDate = if_else(sale_date < ymd("2017-01-01"), "before", "after")) %>% 
+    group_by(block, wfDate) %>% 
+    filter(sale_price > 50000) %>%
+    summarise(avgSale = mean(log(sale_price))) %>% 
+    ungroup() %>% 
+    tidyr::pivot_wider(names_from = wfDate, values_from = avgSale) %>% 
+    mutate(change = after - before)
+
+
+plutoWF %>% left_join(changeDF, by = c("Block" = "block")) %>% 
+    tm_shape() +
+    tm_polygons(col ="change") +
+    tm_shape(wfHarlemBufferHalf) +
+    tm_borders()
+
+```
+
+
+```{r}
+
+didreg = lm(last ~ buffer * time, data = mnSalesRepeat %>% 
+    #st_drop_geometry() %>% 
+    filter(building_class_at_present == "R4") %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present)) %>% 
+    ungroup() %>% 
+                mutate(buffer = if_else(buffer == "Mile", 0, 1),
+                       time = if_else(time =="Before WF", 0, 1)))
+summary(didreg)
+```
+
+## panel data
+
+```{r}
+
+didreg = lm(last ~ buffer * time, data = mnSalesRepeat %>% 
+    #st_drop_geometry() %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present)) %>% 
+    filter(last < 10000000, last > 50000)  %>% 
+    tidyr::pivot_wider(names_from = time, values_from = last) %>% 
+    filter(!is.na(`Before WF`), !is.na(`After WF`)) %>% 
+    tidyr::pivot_longer(names_to = "time", values_to = "last", -c(BL, buffer, class)) %>% 
+    ungroup() %>% 
+                mutate(buffer = if_else(buffer == "Mile", 0, 1),
+                       time = if_else(time =="Before WF", 0, 1)))
+summary(didreg)
+```
+
+```{r}
+
+didreg = lm(last ~ buffer * time, data = mnSalesRepeat %>% 
+    #st_drop_geometry() %>% 
+    group_by(BL, buffer, time) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present)) %>% 
+    filter(last < 10000000, last > 50000)  %>% 
+    tidyr::pivot_wider(names_from = time, values_from = last) %>% 
+    filter(!is.na(`Before WF`), !is.na(`After WF`)) %>% 
+    tidyr::pivot_longer(names_to = "time", values_to = "last", -c(BL, buffer, class)) %>% 
+    ungroup() %>% filter(class == "R4") %>% 
+                mutate(buffer = if_else(buffer == "Mile", 0, 1),
+                       time = if_else(time =="Before WF", 0, 1)))
+summary(didreg)
+```
+
+fixed effects
+```{r}
+library(lfe)
+library(broom)
+FEDF <- mnSalesRepeat %>% 
+   # st_drop_geometry() %>% 
+    mutate(year = year(sale_date)) %>% 
+    group_by(BL, buffer, year) %>% 
+    summarize(last= last(sale_price),
+              class = first(building_class_at_present),
+              time = first(time)) %>% 
+    filter(last < 10000000, last > 50000) %>% 
+                mutate(buffer = if_else(buffer == "Mile", 0, 1),
+                       time = if_else(time =="Before WF", 0, 1),
+                       did = buffer * time) %>% 
+    ungroup()
+
+test <- lfe::felm(last~ did | BL + year, FEDF)
+
+summary(test)
+```
+
+## Hedonic Pricing Model
+
+### 
+```{r}
+harlemlots <- read_csv(file.path(dataDir, "modelling", "harlemSales_Attributes.csv"))
+harlemlots %>% group_by(year) %>% count() 
+```
+
+## make a model per year
+```{r}
+valueFormula <- sale_price ~ 
+    land_square_feet + gross_square_feet + year_built  + flagshipParkDist + parkDist + subwayDist +
+    libDistance + popBlack/TotPop + popHisp/TotPop + avgHHsize + MedHHI + OwnerOccUnits/TotOccUnits + 
+    OO_20k + OO20_49k + OO50_99k + OO50_99k + OO100_149k + OO150_299k + OO300_499k + OO_500_749k + 
+    OO750_999k + OO1mil_ + permits - 1
+
+
+permits <- permitsWF %>% 
+    group_by(borough, Block, year) %>% 
+    summarize(permits = n()) 
+
+harlemDF <- harlemlots%>% 
+    filter(sale_price < 10000000, sale_price > 50000)  %>% 
+    left_join(permits %>% select(-borough)) %>% 
+    left_join(mnSalesJoin %>% select(bbl, block, lot) %>% distinct(.), by = c("Block" = "block", "lot" = "lot"))
+
+harlemDFScale <- harlemDF  %>% 
+    mutate_at(vars(
+                     land_square_feet , gross_square_feet , year_built  , flagshipParkDist , parkDist , subwayDist ,
+                     libDistance , avgHHsize , MedHHI ,OO_20k, OO20_49k, OO50_99k, OO100_149k,OO150_299k,OO300_499k,
+                     OO_500_749k, OO750_999k, OO1mil_, permits), ~(scale(.) %>% as.vector)) %>% 
+    mutate(sale_price = harlemDF$sale_price) %>% 
+    filter(complete.cases(.))
+
+harlemDFModel <- harlemDFScale %>% tidyr::nest(-year)
+
+formulaList <- list(modlog = valueFormula)
+
+library(purrr)
+formulaDF <- map2_dfr(formulaList, formulaList %>% names(), function(x,y)tibble(name = y,formula = list(x)))%>%
+    tidyr::pivot_wider(names_from = name, values_from = formula)
+```
+
+```{r}
+harlemDFModel <- harlemDFModel %>% rowwise() %>% 
+    bind_cols(formulaDF) %>% 
+    tidyr::pivot_longer(-c(year,data), names_to = "name", values_to = "formula")
+
+modelFunc <- function(formula, data){
+    mod <- lm(formula, data)
+}
+predictFunc <- function(mod, data)data %>% mutate(predict = as.vector(predict(mod,data)),
+                                                  predictexp = exp(predict))
+residFunc <- function(data)data %>% mutate(residual = sale_price - predict)
+library(useful)
+## glmnet
+xFunc <- function(formula,data) build.x(formula, data, contrasts=FALSE, sparse=TRUE)
+yFunc <- function(formula,data) build.y(formula, data) %>% as.numeric()
+glmnetFunc <- function(x, y){
+    set.seed(990)
+    mod <- glmnet::glmnet(x=x, y=y,
+                     family='gaussian', standardize = FALSE)
+}
+predictGlmnet <- function(mod, x)tibble(predictGLMNET = as.vector(predict(mod,x,s=0.01)),
+                                        predictGLMENTexp = exp(predictGLMNET))
+
+
+modList <- harlemDFModel %>% mutate(
+                                lmmods = map2(formula,data, ~modelFunc(.x,.y)),
+                                data = map2(lmmods, data,~predictFunc(.x,.y)),
+                                data = map(data, ~residFunc(.x)),
+                                x = map2(formula,data,~xFunc(.x,.y)),
+                                y = map2(formula,data,~yFunc(.x,.y)),
+                                glmnetMods = map2(x,y, ~glmnetFunc(.x,.y)),
+                                dataGlmnet = map2(glmnetMods, x,~predictGlmnet(.x,.y)))
+```
+
+## Diagnostics
+
+
+
+
+```{r}
+modList$data[[1]] %>% ggplot(aes(x=residual)) + geom_histogram()
+```
+
+```{r}
+harlemPLUTO <- st_read(file.path(shapeDir, "harlemPoints"))
+map <- harlemPLUTO %>% inner_join(modList$data[[1]], by = c("BBL" = "bbl"))
+```
+
+```{r}
+    tm_shape(wfHarlemBufferOne) + 
+    tm_borders() +
+    tm_shape(wfHarlemBufferHalf) + 
+    tm_borders() +
+    tm_shape(map)  +
+    tm_symbols(col = "residual") 
+
+```
+
+
+## predict all unit prices per year
+
+```{r}
+allunitsDF <- harlemDFScale %>% select(c(land_square_feet, gross_square_feet, year_built, flagshipParkDist, parkDist, subwayDist,
+                     libDistance, avgHHsize, popBlack, TotPop, popHisp, MedHHI, OwnerOccUnits, TotOccUnits, 
+                     OO_20k, OO20_49k, OO50_99k, OO100_149k,OO150_299k,OO300_499k,
+                     OO_500_749k, OO750_999k, OO1mil_, permits, bbl)) %>% mutate(sale_price = bbl) %>% distinct(.)
+
+modList <- modList %>% mutate(predictData = map(lmmods,~predictFunc(.x,allunitsDF)),
+                              xall = map(formula,~xFunc(.x,allunitsDF)),
+                                dataGlmnetall = map2(glmnetMods, xall,~predictGlmnet(.x,.y)))
+```
+
+
+```{r}
+test <- modList %>% select(year, predictData) %>% tidyr::unnest(predictData) %>%
+    select(year, bbl, predict,predictexp) %>%     
+    bind_cols(modList %>% select(dataGlmnetall) %>% tidyr::unnest(dataGlmnetall)) %>% 
+    left_join(mnSalesJoin %>% select(bbl, time, buffer), by = c("bbl" = "bbl")) %>% 
+    group_by(year, buffer) %>% 
+    summarize(meanPriceLM = mean(predict),
+              medPriceLM = median(predict),
+              meanPriceGL = mean(predictGLMNET),
+              medPriceGL = median(predictGLMNET))
+
+testPlot <- test %>% tidyr::pivot_longer(names_to = "mods", values_to = "price", -c(year, buffer))
+```
+
+```{r}
+testPlot %>% 
+    ggplot(aes(year, price, group = mods)) +
+    geom_point(aes(group = mods, color = mods, shape=buffer)) +
+    geom_line(aes(group = buffer, color = mods), alpha = .2 ) +
+    facet_wrap(~mods) + 
+    theme_minimal()
+```
+
+# Fixed Effects with Hedonic Pricing Outcomes
+```{r}
+FEDFHed <- modList %>% select(year, predictData) %>% tidyr::unnest(predictData) %>%
+    select(year, bbl, predict,predictexp) %>%     
+    bind_cols(modList %>% select(dataGlmnetall) %>% tidyr::unnest(dataGlmnetall)) %>% 
+        left_join(mnSalesJoin %>% select(bbl,buffer), by = c("bbl" = "bbl")) %>% 
+     mutate(time = if_else(year < 2017, "Before WF", "After WF")) %>% 
+
+    filter(predict < 10000000, predict > 50000,predictGLMNET < 10000000, predictGLMNET > 50000) %>% 
+                mutate(buffer = if_else(buffer == "Mile", 0, 1),
+                       time = if_else(time =="Before WF", 0, 1),
+                       did = buffer * time) %>% 
+    ungroup()
+
+feHedLM <- lfe::felm(predict~ did | did | year + bbl, FEDFHed)
+
+summary(feHedLM)
+
+feHedGLM <- lfe::felm(predictGLMNET~ did | year + bbl, FEDFHed) # takes in to account residuals clustered by year
+
+summary(feHedGLM)
+```
+
+# regular dnd regression
+```{r}
+
+didreglm = lm(predict ~ buffer * time, data = FEDFHed)
+summary(didreglm)
+
+didregGLM = lm(predictGLMNET ~ buffer * time, data = FEDFHed)
+summary(didregGLM)
+```
+
+# LM plots
+```{r}
+FEDFHed %>% select(year, bbl, predict, time, buffer) %>% 
+    ggplot(aes(x=year, y=predict, group = bbl)) +
+    geom_line(alpha = .1, aes(color = time)) +
+    facet_wrap(~buffer) +
+    theme_minimal()
+```
+
+
+```{r}
+FEDFHed %>% select(year, bbl, predict, time, buffer) %>% 
+    ggplot(aes(x=year, y=predict)) +
+    geom_hex(bins = 10) +
+    facet_wrap(~buffer) +
+    theme_minimal()
+```
+
+```{r}
+FEDFHed %>% select(year, bbl, predict, time, buffer) %>% 
+    ggplot(aes(x=year, y=predict)) +
+    geom_bin2d(bins = c(5,20)) +
+    facet_wrap(~buffer) +
+    theme_minimal()
+```
+
+
+# glmnet plots
+```{r}
+FEDFHed %>% select(year, bbl, predictGLMNET, time, buffer) %>% 
+    ggplot(aes(x=year, y=predictGLMNET, group = bbl)) +
+    geom_line(alpha = .1, aes(color = time)) +
+    facet_wrap(~buffer) +
+    theme_minimal()
+```
+
+
+```{r}
+FEDFHed %>% select(year, bbl, predictGLMNET, time, buffer) %>% 
+    ggplot(aes(x=year, y=predictGLMNET)) +
+    geom_hex(bins = 10) +
+    facet_wrap(~buffer) +
+    theme_minimal()
+```
+
+```{r}
+FEDFHed %>% select(year, bbl, predictGLMNET, time, buffer) %>% 
+    ggplot(aes(x=year, y=predictGLMNET)) +
+    geom_bin2d(bins = c(5,20)) +
+    facet_wrap(~buffer) +
+    theme_minimal()
+```
+
+
+## Over buffers
+ for each distance
+ for each year
+```{r}
+## for each distance
+distanceList <- as.list(seq(1320,4620, 660))
+
+bufferFunction <- function(buffer, data, wf){
+    varName  <- paste0("buffer_", buffer)
+    wfBuffer <- wf %>% st_buffer(buffer)
+    
+    output <- data %>% 
+    filter(!Block %in% c(1111, 1897)) %>% 
+    sf::st_join(wfBuffer %>%mutate(!!varName := 1),join =st_within) %>%  
+        st_drop_geometry() %>% 
+        select(!!varName)
+}
+
+distanceBuffers <- map_dfc(distanceList, ~bufferFunction(.x, plutoWF, wfHarlem))
+distanceBuffers <- distanceBuffers %>% replace(is.na(.), 0)
+```
+
+
+```{r}
+joinBuffer <- harlemDFScale %>% select(c(land_square_feet, gross_square_feet, year_built, flagshipParkDist, parkDist, subwayDist,
+                     libDistance, avgHHsize, popBlack, TotPop, popHisp, MedHHI, OwnerOccUnits, TotOccUnits, 
+                     OO_20k, OO20_49k, OO50_99k, OO100_149k,OO150_299k,OO300_499k,
+                     OO_500_749k, OO750_999k, OO1mil_, permits, Block, bbl))  %>% distinct(.) %>% 
+    left_join(plutoWF %>% bind_cols(distanceBuffers) %>% st_drop_geometry %>% distinct(.)) %>% 
+    select(starts_with("buffer_"))
+
+modBuffer <- modList %>% 
+    mutate(joinBuffer = map(year, function(x) joinBuffer)) %>% 
+    mutate(bufferDF = map2(.x = predictData,.y =  joinBuffer,.f =  function(x,y) tibble(x %>% bind_cols(y))))
+
+modBufferPlot <- modBuffer %>% select(year, bufferDF) %>% tidyr::unnest(bufferDF) %>%
+    select(year, bbl, predict, starts_with("buffer_")) %>%     
+    bind_cols(modList %>% select(dataGlmnetall) %>% tidyr::unnest(dataGlmnetall)) %>% 
+    select(-predictGLMENTexp) %>% 
+    tidyr::pivot_longer(names_to = "bufferType", values_to = "treatment", -c(year, bbl, predict, predictGLMNET)) %>% 
+    group_by(year, bufferType, treatment) %>% 
+    summarize(meanPriceLM = mean(predict),
+              medPriceLM = median(predict),
+              meanPriceGL = mean(predictGLMNET),
+              medPriceGL = median(predictGLMNET))
+```
+
+```{r}
+modBufferPlot %>% 
+    tidyr::pivot_longer(names_to = "mods", values_to = "price", -c(year, bufferType, treatment)) %>% 
+    mutate(treatment = as.factor(treatment)) %>% 
+    ggplot(aes(year, price, group = mods)) +
+    geom_point(aes(group = mods, color = mods, shape=treatment)) +
+    geom_line(aes(group = treatment, color = mods), alpha = .2 ) +
+    facet_grid(mods~bufferType, scales = "free_y") + 
+    theme_minimal()+
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+```
+
+```{r}
+FEDBufferDF <- modBuffer %>% select(year, bufferDF) %>% tidyr::unnest(bufferDF) %>%
+    select(year, bbl, predict, starts_with("buffer")) %>%     
+    bind_cols(modList %>% select(dataGlmnetall) %>% tidyr::unnest(dataGlmnetall) %>% select(predictGLMNET)) %>% 
+    filter(predict < 10000000, predict > 50000,predictGLMNET < 10000000, predictGLMNET > 50000) %>% 
+    ungroup()
+
+
+fedDiagFunc <- function(distance, df, wfYear = 2017, FE = TRUE, mod = "LM"){
+    varName = paste0("buffer_", distance)
+    
+    if(mod != "LM") FEDBufferDF <- FEDBufferDF %>% select(-predict) %>% rename(predict = predictGLMNET)
+    
+    modDF <- FEDBufferDF %>% select(predict, !!varName, bbl, year) %>% 
+             mutate(time = if_else(year < wfYear, 0, 1)) %>%
+        mutate(did = time * !!as.name(varName))
+    
+    if(FE) feHedLM <- lfe::felm(predict~ did | bbl + year, modDF)
+    else feHedLM <- lfe::felm(predict~ did, modDF)
+
+rmse <- sqrt(mean(feHedLM$residuals^2))
+}
+
+rmseVec <- map_dbl(distanceList, ~fedDiagFunc(.x, FEDBufferDF,wfYear = 2017, FE = TRUE, mod = "GLMNET"))
+
+modGrid <- expand.grid(distance = seq(1320,4620, 660),
+            year = seq(2011,2018,1),
+            model = c("LM", "GLMENT"),stringsAsFactors = FALSE)
+```
+
+```{r}
+modGridList <- split(modGrid, seq(nrow(modGrid)))
+rmseVec <- modGridList %>%  map_dbl(~fedDiagFunc(.x$distance, FEDBufferDF, .x$year,FE = TRUE, mod=.x$model))
+modGrid <- modGrid %>% mutate(rmse = rmseVec)
+```
+
+```{r}
+modGrid %>% mutate(distance = as.factor(distance)) %>% 
+    ggplot(aes(year, rmse, group = model, color = model)) + 
+    geom_line() +
+    facet_wrap(~distance) +
+    theme_minimal()+
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r}
+modGrid %>% mutate(distance = as.factor(distance)) %>% 
+    ggplot(aes(year, rmse, group = model, color = model)) + 
+    geom_line() +
+    facet_grid(model~distance, scales = "free_y") +
+    theme_minimal()+
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### remove quarter mile before 

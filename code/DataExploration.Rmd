@@ -1,0 +1,531 @@
+---
+title: "Exploration"
+author: "Kaz Sakamoto"
+output: 
+    html_document:
+        toc: yes
+        toc_float:
+            collapsed: no
+            smooth_scoll: yes
+        number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE, cache = TRUE)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(sf)
+library(leaflet)
+## here we are going to find the root_file 
+root <- rprojroot::find_rstudio_root_file()
+## we are going to set the data file path here
+dataDir <- file.path(root, 'data')
+shapeDir <- file.path(root, 'shape')
+```
+
+# Whole Foods
+
+
+
+Here is the location for the two Whole Foods locations
+```{r}
+wf <- tibble(lat = c(40.8076461,40.6749728),
+             long = c(-73.9483658,-73.9882083), 
+             store = c("Whole Foods Harlem", "Whole Foods Gowanus"))
+wholeFoods<- wf %>% st_as_sf(coords = c("long","lat"), crs = 4326)
+```
+
+# Sales Data
+
+This is the compelte rolling sales data between 2010-2019
+
+```{r}
+allSales <- readr::read_csv(file.path(dataDir, "rollingSales/nycSales_2010_2019"))
+```
+
+Here is a little bit of cleaning of the data
+
+```{r}
+resSales <- allSales %>% filter(str_detect(`BUILDING CLASS AT TIME OF SALE`,pattern = "[A,B,C,D]")) %>% 
+    mutate(`SALE DATE` = as_date(`SALE DATE`),
+           borough_name = case_when(BOROUGH == 1 ~ "Manhattan",
+                                    BOROUGH == 2 ~ "Bronx",
+BOROUGH == 3 ~ "Brooklyn",
+BOROUGH == 4 ~ "Queens",
+BOROUGH == 5 ~ "Staten Island")) %>% janitor::clean_names() %>% 
+    mutate(year = year(sale_date),
+                    month = month(sale_date),
+                    borough = as.factor(borough))
+rm(allSales)
+```
+
+here is a brek down of the median price for residential units across boroughs and dates
+
+```{r}
+resSales %>%
+    filter(sale_price > 10000, residential_units < 3, residential_units > 0) %>% 
+    group_by(borough, month, year,residential_units) %>% summarize(priceMean = mean(sale_price),
+                                                 priceMed = median(sale_price),
+                                                 date = min(sale_date)) %>% 
+    ggplot(aes(x = date, y = priceMed,color = borough)) + 
+    geom_point() +
+    geom_line() + 
+    facet_grid(borough~residential_units, scales = "free_y") + 
+    theme_minimal()
+```
+
+# Census Tracts and Sales
+
+```{r}
+nyct <- st_read(file.path(shapeDir,'nyct2010'))
+
+
+nyct <- nyct %>% mutate(geo_county  = case_when(BoroName == 'Bronx' ~ '005',
+                                                BoroName == 'Brooklyn' ~ '047',
+                                                BoroName == 'Manhattan' ~ '061',
+                                                BoroName == 'Queens' ~ '081',
+                                                BoroName == 'Staten Island' ~ '085',
+                                                TRUE ~ 'Other'),
+                        geo_fips = paste0("36", geo_county, CT2010)) %>% janitor::clean_names()
+```
+
+```{r}
+acs2018 <- readr::read_csv(file.path(dataDir, "acs20185yr.csv"))
+
+acs2018 <- acs2018 %>% 
+    janitor::clean_names() %>% 
+    mutate(geo_fips = as.character(geo_fips))
+
+```
+
+```{r}
+# 
+# placeTotal <- readr::read_csv(file.path(dataDir, "placesTotal.csv")) %>% 
+#     st_as_sf(coords = c("long","lat"), crs = 4326) %>% 
+#     st_transform(2263)
+# 
+# placeTotal <- st_join(placeTotal, nyct)
+# 
+```
+
+```{r}
+# 
+# resSales <- resSales %>% left_join(placeTotal %>% st_drop_geometry())
+# 
+# resSales %>% 
+#     filter(!is.na(puma)) %>% 
+#     group_by(borough_name, puma, year) %>% 
+#     summarize(medPrice = median(sale_price),
+#               avgPrice = mean(sale_price),
+#               count = n()) %>% 
+#     ggplot(aes(year, medPrice, color = medPrice)) +
+#     geom_point() + 
+#     facet_wrap(~puma)
+```
+
+# Census Tracts Demographics
+
+```{r}
+nyct <- nyct %>% left_join(acs2018)
+```
+
+```{r}
+# palPrice <- colorNumeric( palette = "Reds",
+#                             domain = placeTotal$sale_price)
+palValue <- colorNumeric( palette = "Reds",
+                            domain = nyct$median_value)
+leaflet(options = leafletOptions(zoomControl = TRUE)) %>% 
+    addPolygons(data = nyct %>% st_transform(4326), 
+                        stroke = .4,
+                        color = ~palValue(median_value),
+                        label = ~median_value,
+                        group = "medianValue") %>% 
+            setView(lat = 40.7445698, lng = -73.9375989, zoom = 12) %>% 
+            addProviderTiles(providers$CartoDB.DarkMatter) %>% 
+            # addCircleMarkers(data = placeJoin, 
+            #                  stroke = .5, radius = 3,color = ~palPrice(sale_price),
+            #                  label = ~address,
+            #                  group = "Sales")  %>% 
+        addLayersControl(
+            overlayGroups = c("medianValue", "Sales"),
+            options = layersControlOptions(collapsed = FALSE)
+        )
+    
+```
+
+# Census Block Groups Demographics
+
+```{r}
+nybg <- st_read(file.path(shapeDir,'nycb2010'))
+
+
+nybg <- nybg %>% mutate(geo_county  = case_when(BoroName == 'Bronx' ~ '005',
+                                                BoroName == 'Brooklyn' ~ '047',
+                                                BoroName == 'Manhattan' ~ '061',
+                                                BoroName == 'Queens' ~ '081',
+                                                BoroName == 'Staten Island' ~ '085',
+                                                TRUE ~ 'Other'),
+                        blockGroup = stringr::str_sub(CB2010,start = 1,1),
+                        geo_fips = paste0("36", geo_county, CT2010, blockGroup)) %>% janitor::clean_names()
+
+# nybg <- nybg %>% st_buffer(0) %>% 
+#     group_by(geo_fips) %>% 
+#   summarize(geometry = st_union(geometry))
+```
+<!-- url:  -->
+<!-- https://www.socialexplorer.com/tables/ACS2018_5yr/R12555664 -->
+```{r}
+
+acsbg2018 <- readxl::read_xls(file.path(dataDir, "acs20185yrBlockGroup.xls"))
+acsbg2018 <- acsbg2018 %>% 
+    janitor::clean_names() %>% 
+    mutate(geo_fips = as.character(geo_fips))
+
+```
+
+<!-- url: -->
+<!-- https://www.socialexplorer.com/tables/ACS2014_5yr/R12555594 -->
+
+```{r}
+
+acsbg2014 <- readxl::read_xls(file.path(dataDir, "acs20145yrBlockGroup.xls"))
+acsbg2014 <- acsbg2014 %>% 
+    janitor::clean_names() %>% 
+    mutate(geo_fips = as.character(geo_fips))
+
+```
+
+```{r}
+acsbg2014Value <- acsbg2014 %>% select(geo_fips,median_value) %>% 
+    rename(median_value2014 = median_value)
+nybgJoin <- nybg %>% left_join(acsbg2018) %>% 
+    left_join(acsbg2014Value)
+nybgJoin <- nybgJoin %>% mutate(medValueDiff = median_value - median_value2014)
+```
+
+```{r}
+palValue2014 <- colorNumeric( palette = "Reds",
+                            domain = nybgJoin$median_value2014)
+
+
+palValue2018 <- colorNumeric( palette = "Reds",
+                            domain = nybgJoin$median_value)
+
+palChange <- colorNumeric(palette = "RdYlGn",
+                          domain = nybgJoin$medValueDiff)
+
+leaflet(data = nybgJoin %>% st_transform(4326), 
+        options = leafletOptions(zoomControl = TRUE)) %>% 
+    addProviderTiles(providers$CartoDB.DarkMatter) %>% 
+    setView(lat = 40.7445698, lng = -73.9375989, zoom = 12) %>% 
+    addPolygons(
+        stroke = .3,
+        color = ~palValue2018(median_value),
+        label = ~median_value,
+        group = "Median Value 2018") %>% 
+    
+    addPolygons( 
+        stroke = .3,
+        color = ~palValue2014(median_value2014),
+        label = ~median_value2014,
+        group = "Median Rent")  %>% 
+        addPolygons( 
+        stroke = .3,
+        color = ~palChange(medValueDiff),
+        label = ~medValueDiff,
+        group = "Median Value Change") %>%
+  addLegend("bottomright", pal = palChange, values = ~medValueDiff,
+    title = "Median Value Change",
+    labFormat = labelFormat(prefix = "$"),
+    opacity = 1
+  ) %>%  
+    addMarkers(data = wholeFoods,label = ~store) %>% 
+    addLayersControl(
+        baseGroups  = c("Median Value", "Median Rent","Median Value Change"),
+        options = layersControlOptions(collapsed = FALSE)
+    )
+    
+```
+
+# Cultural Institutions
+
+```{r}
+facilities <-  st_read(file.path(shapeDir, "facilities_2019")) %>% janitor::clean_names()
+
+CIFilters <-c("ACADEMIC AND SPECIAL LIBRARIES",
+              "MUSEUMS", "PUBLIC LIBRARIES")
+
+CI <- facilities %>% filter(facsubgrp %in% CIFilters) 
+
+```
+
+
+# Parks
+
+```{r}
+parkFilters <- c("PRIVATELY OWNED PUBLIC SPACE",
+                 "RECREATION AND WATERFRONT SITES", 
+                 "PARKS")
+
+parks <- facilities %>% filter(facsubgrp %in% parkFilters) 
+rm(facilities)
+```
+
+# DOB Permits 
+```{r}
+permits <- readr::read_csv(file.path(dataDir, "DOB_Permit_Issuance2010_2020.csv")) %>% 
+    janitor::clean_names()
+permits <- permits %>% 
+    select(borough, job_type,
+           block, lot, permit_type,
+           filing_date, latitude, longitude)
+
+permits <- permits %>% 
+    mutate(filing_date = lubridate::mdy_hms(filing_date),
+           year = lubridate::year(filing_date),
+           month = lubridate::month(filing_date))
+
+permits %>% group_by(borough, month, year) %>% 
+    summarize(date = min(filing_date),
+              count = n()) %>% 
+    ggplot(aes(date, count)) +
+    geom_point(aes(color = borough)) +
+    geom_smooth() + 
+    facet_wrap(~borough) +
+    theme(legend.position = "none")
+```
+
+
+## Whole Foods Analysis
+```{r}
+wholeFoods1mBuffer <- st_buffer(wholeFoods %>% st_transform(2263), dist = 5280)
+```
+nyc block group intersect
+```{r}
+nyctJoin <- st_join(nyct, wholeFoods1mBuffer)
+nyctJoin %>% filter(!is.na(store))
+```
+
+```{r}
+resdf <- readr::read_csv(file.path(dataDir, "nyc_Sales2010_2020geocoded.csv"))
+resdf <- resSales %>% left_join(resdf)
+resdf <- resdf %>% filter(!is.na(lat))
+
+resShape <- resdf %>% st_as_sf(crs =4326, coords =  c("long", "lat")) %>% 
+    st_transform(2263)
+resShapeJoin <- st_join(resShape, nyctJoin)
+
+```
+
+
+```{r}
+resShapeJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+      filter(!(abs(sale_price - median(sale_price)) > 4*sd(sale_price))) %>% 
+    mutate(quart = quarter(sale_date,with_year = FALSE),
+            borough_name = as.character(borough_name),
+            vistype = if_else(is.na(store), borough_name, 
+                  if_else(store == "Whole Foods Harlem", "WF Harlem", borough_name))) %>% 
+    group_by(vistype, quart, year,residential_units) %>% 
+    summarize(priceMean = mean(sale_price),
+              priceMed = median(sale_price),
+              date = min(sale_date)) %>% 
+    filter(priceMed > 0) %>% 
+    ggplot(aes(x = date, y = priceMed)) + 
+    geom_point(aes(color = vistype)) +
+    geom_line(aes(color = vistype)) +
+    geom_smooth() +    
+    facet_wrap(~vistype, scales = "free_y") + 
+    theme_minimal()
+```
+
+```{r}
+resShapeJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+      filter(!(abs(sale_price - median(sale_price)) > 4*sd(sale_price))) %>% 
+    mutate(quart = quarter(sale_date,with_year = FALSE),
+            borough_name = as.character(borough_name),
+            vistype = if_else(is.na(store), borough_name, 
+                  if_else(store == "Whole Foods Harlem", "WF Harlem", borough_name))) %>% 
+    group_by(vistype, year) %>% 
+    summarize(priceMed = median(sale_price)) %>% 
+    ungroup() %>% 
+    tidyr::pivot_wider(names_from = year,values_from = priceMed)
+```
+
+
+```{r}
+resShapeJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+    mutate(boro_ct2010 = as.character(boro_ct2010)) %>% 
+    group_by(boro_ct2010, year) %>%
+    summarize(priceMed = median(sale_price)) %>% 
+    ungroup() %>% 
+    tidyr::pivot_wider(names_from = year,values_from = priceMed)
+    
+```
+
+
+```{r}
+medianPriceCT <- resShapeJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+    mutate(boro_ct2010 = as.character(boro_ct2010)) %>% 
+    group_by(boro_ct2010) %>%
+    summarize(priceMed = median(sale_price)) %>% 
+    ungroup()
+nyct <- st_read(file.path(shapeDir,'nyct2010'))
+
+
+nyct <- nyct %>% mutate(geo_county  = case_when(BoroName == 'Bronx' ~ '005',
+                                                BoroName == 'Brooklyn' ~ '047',
+                                                BoroName == 'Manhattan' ~ '061',
+                                                BoroName == 'Queens' ~ '081',
+                                                BoroName == 'Staten Island' ~ '085',
+                                                TRUE ~ 'Other'),
+                        geo_fips = paste0("36", geo_county, CT2010)) %>% janitor::clean_names()
+nyct <- nyct %>% left_join(medianPriceCT)
+```
+
+```{r}
+nyct$scaledPrice <- scale(nyct$priceMed)
+palmedPrice <- colorNumeric(palette = "Reds",
+                          domain = nyct$scaledPrice)
+
+leaflet(data = nyct %>% st_transform(4326), 
+        options = leafletOptions(zoomControl = TRUE)) %>% 
+    addProviderTiles(providers$CartoDB.DarkMatter) %>% 
+    setView(lat = 40.7445698, lng = -73.9375989, zoom = 12) %>% 
+    addPolygons(
+        stroke = .2,
+        fillColor = ~palmedPrice(scaledPrice),
+        color = ~palmedPrice(scaledPrice),
+        fillOpacity = .5,
+        label = ~priceMed,
+        group = "Sales Median Price") 
+```
+
+nyc block group intersect
+```{r}
+nybgJoin <- st_join(nybg, wholeFoods1mBuffer)
+nybgJoin %>% filter(!is.na(store))
+```
+
+```{r}
+resBGJoin <- st_join(resShape, nybgJoin)
+```
+
+
+```{r}
+resBGJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+      filter(!(abs(sale_price - median(sale_price)) > 4*sd(sale_price))) %>% 
+    mutate(quart = quarter(sale_date,with_year = FALSE),
+            borough_name = as.character(borough_name),
+            vistype = if_else(is.na(store), borough_name, 
+                  if_else(store == "Whole Foods Harlem", "WF Harlem", borough_name))) %>% 
+    group_by(vistype, quart, year,residential_units) %>% 
+    summarize(priceMean = mean(sale_price),
+              priceMed = median(sale_price),
+              date = min(sale_date)) %>% 
+    filter(priceMed > 0) %>% 
+    ggplot(aes(x = date, y = priceMed)) + 
+    geom_point(aes(color = vistype)) +
+    geom_line(aes(color = vistype)) +
+    geom_smooth() +    
+    facet_wrap(~vistype, scales = "free_y") + 
+    theme_minimal()
+```
+
+```{r}
+resBGJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+      filter(!(abs(sale_price - median(sale_price)) > 4*sd(sale_price))) %>% 
+    mutate(quart = quarter(sale_date,with_year = FALSE),
+            borough_name = as.character(borough_name),
+            vistype = if_else(is.na(store), borough_name, 
+                  if_else(store == "Whole Foods Harlem", "WF Harlem", borough_name))) %>% 
+    group_by(vistype, year) %>% 
+    summarize(priceMed = median(sale_price)) %>% 
+    ungroup() %>% 
+    tidyr::pivot_wider(names_from = year,values_from = priceMed)
+```
+
+
+```{r}
+resBGJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+    mutate(bctcb2010 = as.character(bctcb2010)) %>% 
+    group_by(bctcb2010, year) %>%
+    summarize(priceMed = median(sale_price)) %>% 
+    ungroup() %>% 
+    tidyr::pivot_wider(names_from = year,values_from = priceMed)
+    
+```
+
+
+```{r}
+medianPriceCB <- resBGJoin %>% 
+    st_drop_geometry() %>%
+    filter(sale_price > 10000,residential_units < 3) %>% 
+    mutate(bctcb2010 = as.character(bctcb2010)) %>% 
+    group_by(bctcb2010) %>%
+    summarize(priceMed = median(sale_price)) %>% 
+    ungroup()
+
+nybg <- nybg %>% left_join(medianPriceCB)
+```
+
+```{r}
+nybg$scaledPrice <- scale(nybg$priceMed)
+palmedPrice <- colorNumeric(palette = "Reds",
+                          domain = nybg$scaledPrice)
+
+leaflet(data = nybg %>% st_transform(4326), 
+        options = leafletOptions(zoomControl = TRUE)) %>% 
+    addProviderTiles(providers$CartoDB.DarkMatter) %>% 
+    setView(lat = 40.7445698, lng = -73.9375989, zoom = 12) %>% 
+    addPolygons(
+        stroke = .2,
+        fillColor = ~palmedPrice(scaledPrice),
+        color = ~palmedPrice(scaledPrice),
+        fillOpacity = .5,
+        label = ~priceMed,
+        group = "Sales Median Price") 
+```
+
+# Distanaces
+
+```{r}
+nearDist <- function(property, features){
+    # print(st_crs(features))
+    # print(st_crs(property))
+    nearFeature <- features[st_nearest_feature(property, features),]
+    distance <- st_distance(property, nearFeature)
+    return(distance)
+}
+```
+
+```{r}
+# CIDist <- split(resShape[,"geometry"], seq(nrow(resShape))) %>% purrr::map_dbl(~nearDist(.x, CI))
+# parksDist <- split(resShape[,"geometry"], seq(nrow(resShape))) %>% purrr::map_dbl(~nearDist(.x, parks))
+
+# distDF <- tibble(CIDist,parksDist)
+# readr::write_csv(distDF,"distDF.csv")
+
+# subways <- st_read(file.path(shapeDir,"SubwayEntrances")) %>% st_transform(2263)
+# SubwayDist <- split(resShape[,"geometry"], seq(nrow(resShape))) %>% purrr::map_dbl(~nearDist(.x, subways))
+
+subwayDistDF <- tibble(SubwayDist)
+readr::write_csv(subwayDistDF, "subwayDist.csv")
+```
+
+

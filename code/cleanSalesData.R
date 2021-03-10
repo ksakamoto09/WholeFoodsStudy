@@ -25,7 +25,7 @@ combinexlsFunc <- function(file){
 }
 
 combinexlsxFunc <- function(file){
-    output <- readxl::read_xlsx(file, ,skip = 5,col_names = names(test)) %>% 
+    output <- readxl::read_xlsx(file,skip = 5,col_names = names(test)) %>% 
         mutate(BOROUGH = as.character(BOROUGH),
                `TAX CLASS AT TIME OF SALE` = as.character(`TAX CLASS AT TIME OF SALE`),
                `APARTMENT NUMBER` = as.character(`APARTMENT NUMBER`))
