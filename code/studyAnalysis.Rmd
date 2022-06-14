@@ -1,0 +1,1018 @@
+---
+title: "Study Analysis"
+author: "Kaz"
+date: "08/04/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, error = FALSE,message = FALSE)
+root <- rprojroot::find_rstudio_root_file()
+dataDir <- file.path(root, 'data')
+shapeDir <- file.path(root, 'shape')
+
+library(dplyr)
+library(readxl)
+library(purrr)
+library(readr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(googlesheets4)
+library(hpiR)
+library(lfe)
+library(tmap)
+
+gs4_auth(
+  email = "ksakamoto09@gmail.com",
+  path = NULL,
+  scopes = "https://www.googleapis.com/auth/spreadsheets",
+  cache = gargle::gargle_oauth_cache(),
+  use_oob = gargle::gargle_oob_default(),
+  token = NULL
+)
+
+```
+
+## Data
+
+First let's get the pluto data
+
+```{r plutoData}
+
+## whole foods
+wf <- st_as_sf(tibble(lat = 40.8077498,
+       long = -73.9462876,
+       name = "WF_Harlem"), coords = c("long", "lat"),
+       crs = 4326)
+
+pluto <- sf::st_read(file.path(shapeDir, "PLUTO_Dissolve")) %>% filter(Borough == "MN")
+
+wfHarlem <- wf  %>% sf::st_transform(2263)
+wfHarlemBufferHalf <- wfHarlem %>% sf::st_buffer(2640)
+
+wfHarlemBufferHalf <- wfHarlem %>% sf::st_buffer(2640*1.2) # testing quarter
+wfHarlemBufferOne <- wfHarlem %>% sf::st_buffer(2640*2)
+
+plutoWF <- pluto %>% filter(sf::st_intersects(pluto, wfHarlemBufferOne,sparse = FALSE)) %>% 
+  select(BoroName, Block) %>% 
+  group_by(Block) %>% 
+  summarize(BoroName = first(BoroName)) %>% 
+  sf::st_cast() %>% 
+  ungroup() %>% 
+  filter(!Block %in% c(1111, 1897)) %>% 
+  sf::st_join(wfHarlemBufferHalf %>% mutate(buffer = "Half"),join =sf::st_within) %>%  
+  dplyr::mutate(buffer = if_else(is.na(buffer), "Mile", buffer),
+                Block = as.character(Block))
+
+```
+
+add the actual distance from whole foods to unit.
+
+```{r}
+
+```
+
+
+Next we'll get the sales data
+```{r salesData}
+## sales
+# for building classes https://www.propertyshark.com/mason/text/nyc_building_class.html
+mnSalesJoin <- readr::read_csv(file.path(dataDir, "modelling/allSalesForModel.csv")) %>% 
+    mutate(rowid = row_number(),
+           block = as.character(block)) %>% 
+    filter(sale_price > 50000, sale_price < 10000000,
+           tax_class_at_time_of_sale %in% c(1,2),
+           str_starts(building_class_at_present, "A|B|C|D|R|S")) %>% 
+  left_join(plutoWF %>% sf::st_drop_geometry() %>% 
+              select(Block, buffer) %>% 
+              rename(block = Block))
+
+streeteasy <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1j9HIF-DY08jo0tyi_Rl6AQ3vkTcwlq9DvSo5znpgXyc",sheet = 1)
+
+newDF <- tibble(block = streeteasy$block,
+                lot = streeteasy$lot,
+                sale_price = streeteasy$sale_price,
+                sale_date = streeteasy$sale_date,
+                beds = streeteasy$beds,
+                baths = streeteasy$baths,
+                sqft = streeteasy$sqft)%>% 
+  mutate(sale_date = lubridate::as_datetime(sale_date)) 
+```
+
+## imputation
+```{r}
+imputeDF <- newDF %>% 
+  group_by(block, lot) %>% 
+  #tidyr::fill(beds, baths, sqft) %>%  
+  tidyr::fill(beds, baths, sqft, .direction = "up") %>% 
+  ungroup()
+
+preProcValues <- preProcess(imputeDF %>% 
+                          #dplyr::select(beds, baths, sqft) %>%
+                            as.data.frame(),
+                            method = c("knnImpute"),
+                            k = 5,
+                            knnSummary = mean)
+imputeDF2 <- predict(object = preProcValues, newdata = imputeDF %>% as.data.frame(), na.action = na.pass)
+
+procNames <- data.frame(col = names(preProcValues$mean), mean = preProcValues$mean, sd = preProcValues$std)
+
+for(i in procNames$col){
+ imputeDF2[i] <- imputeDF2[i]*preProcValues$std[i]+preProcValues$mean[i] 
+}
+
+newDF2 <- imputeDF2 %>% 
+    mutate_at(vars(block, lot, sale_date), as.character) %>% 
+  mutate(baths = ceiling(baths / 0.5) * 0.5,
+         beds = round(beds))
+```
+
+```{r}
+mnSalesFinal <- mnSalesJoin %>% 
+  mutate_at(vars(block, lot, sale_date), as.character) %>% 
+  left_join(newDF2, by = c("block" = "block", 
+                           "lot" = "lot",
+                           "sale_date" = "sale_date",
+                           "sale_price" = "sale_price"))
+
+wfDF <- mnSalesFinal %>% filter(buffer == "Half")
+notwfDF <- mnSalesFinal %>% filter(buffer == "Mile")
+```
+
+```{r}
+#1594
+mnSalesJoin %>% filter(block== 1594) %>% 
+  select(sale_price, sale_date, block, lot)
+newDF2%>% filter(block== 1594)
+newDF%>% filter(block== 1594)
+
+```
+
+
+## HPI Models
+create them for different distances
+
+```{r hpiData}
+
+## Different Distances
+#####
+distanceList <- as.list(seq(1320,4620, 660))
+
+bufferFunction <- function(buffer, data, wf){
+  varName  <- paste0("buffer_", buffer)
+  wfBuffer <- wf %>% sf::st_buffer(buffer)
+  
+  output <- data %>% 
+    filter(!Block %in% c(1111, 1897)) %>% 
+    sf::st_join(wfBuffer %>% mutate(!!varName := 1),join =sf::st_within) %>%  
+    sf::st_drop_geometry() %>% 
+    select(!!varName)
+}
+
+distanceBuffers <- map_dfc(distanceList, ~bufferFunction(.x, plutoWF, wfHarlem))
+distanceBuffers <- distanceBuffers %>% replace(is.na(.), 0)
+
+harlemDFScale <- mnSalesFinal  %>% 
+  select(geoid, sale_date, sale_price, bbl,block,rowid,
+         'land_square_feet', 'gross_square_feet', 'flagshipParkDist',
+         'parkDist', 'subwayDist', 'libDistance', 'totPermits',
+         'HispanicLatinoPercent', 'whitePercent','blackPercent',
+         'BAPlusPercent', 'ownerPercent', 'median_gross_rent', 
+         'median_household_income_in_2019_inflation_adjusted_dollars',
+         'total_units','beds', 'baths', 'sqft') %>% 
+  mutate_at(vars(
+    'land_square_feet', 'gross_square_feet', 'flagshipParkDist',
+    'parkDist', 'subwayDist', 'libDistance', 'totPermits','median_gross_rent', 
+    'median_household_income_in_2019_inflation_adjusted_dollars',
+    'total_units','beds', 'baths', 'sqft'), ~(scale(.) %>% as.vector)) 
+# %>% filter(complete.cases(.))
+
+joinBuffer <- harlemDFScale  %>% 
+  left_join(plutoWF %>% bind_cols(distanceBuffers) %>% sf::st_drop_geometry() %>% distinct(.), by = c("block"="Block")) %>% 
+  group_by(block) %>% 
+  filter(complete.cases(sale_price, beds, baths)) %>% 
+  tidyr::fill(flagshipParkDist, parkDist, subwayDist, libDistance,
+              totPermits, median_gross_rent,total_units,
+              median_household_income_in_2019_inflation_adjusted_dollars,
+              .direction = "downup") %>% 
+  ungroup()
+
+
+```
+
+helper functions
+
+```{r hpiFunctions}
+
+bufferHPI <- function(buffer, df,period = "yearly"){
+  bufferCol = paste0("buffer_", buffer)
+  sales_hhdfwf <- hedCreateTrans(trans_df = df %>% filter(get(bufferCol)==1),
+                                 prop_id = 'bbl',
+                                 trans_id = 'rowid',
+                                 price = 'sale_price',
+                                 date= 'sale_date',
+                                 periodicity = period)
+  sales_hhdfnotwf <- hedCreateTrans(trans_df = df %>% filter(get(bufferCol)==0),
+                                    prop_id = 'bbl',
+                                    trans_id = 'rowid',
+                                    price = 'sale_price',
+                                    date= 'sale_date',
+                                    periodicity = period)
+  hed_modelwf <- hpiModel(model_type = 'hed',
+                          hpi_df = sales_hhdfwf,
+                          estimator = 'base',
+                          dep_var = 'price',
+                          ind_var = c(
+                            #'land_square_feet', 'gross_square_feet', 
+                                      'flagshipParkDist',
+                                      'parkDist', 'subwayDist', 'libDistance', 'totPermits',
+                                      'HispanicLatinoPercent', 'whitePercent','blackPercent',
+                                      'BAPlusPercent', 'ownerPercent', 'median_gross_rent', 
+                                      'median_household_income_in_2019_inflation_adjusted_dollars', 
+                                      'total_units','beds', 'baths', 'sqft'),
+                          log_dep = TRUE)
+  
+  hed_modelnotwf <- hpiModel(model_type = 'hed',
+                             hpi_df = sales_hhdfnotwf,
+                             estimator = 'base',
+                             dep_var = 'price',
+                             ind_var =c(
+                               #'land_square_feet', 'gross_square_feet', 
+                                        'flagshipParkDist',
+                                        'parkDist', 'subwayDist', 'libDistance', 'totPermits',
+                                        'HispanicLatinoPercent', 'whitePercent','blackPercent',
+                                        'BAPlusPercent', 'ownerPercent', 'median_gross_rent', 
+                                        'median_household_income_in_2019_inflation_adjusted_dollars',
+                                        'total_units','beds', 'baths', 'sqft'),
+                             log_dep = TRUE)
+  hed_indexwf <- modelToIndex(model_obj = hed_modelwf)
+  hed_indexnnonwf <- modelToIndex(model_obj = hed_modelnotwf)
+list("bufferCol" = bufferCol,
+     "hed_indexwf" = hed_indexwf,
+     "hed_indexnnonwf" = hed_indexnnonwf)
+}
+
+dataFunc <- function(data, period = "yearly"){
+  if(period == "yearly"){
+    ## for year
+    bind_rows(tibble(val = data$hed_indexnnonwf$value, type = "control",
+                     time = as.numeric(data$hed_indexnnonwf$name)),
+              tibble(val = data$hed_indexwf$value, type = "treated",
+                     time = as.numeric(data$hed_indexwf$name))) 
+  }else {
+    bind_rows(tibble(val = data$hed_indexnnonwf$value, type = "control",
+                     time = data$hed_indexnnonwf$numeric),
+              tibble(val = data$hed_indexwf$value, type = "treated",
+                     time = data$hed_indexwf$numeric)) 
+  }
+}
+
+bufferHPIrf <- function(buffer, df,period = "yearly"){
+  bufferCol = paste0("buffer_", buffer)
+  sales_hhdfwf <- hedCreateTrans(trans_df = df %>% filter(get(bufferCol)==1),
+                                 prop_id = 'bbl',
+                                 trans_id = 'rowid',
+                                 price = 'sale_price',
+                                 date= 'sale_date',
+                                 periodicity = period)
+  sales_hhdfnotwf <- hedCreateTrans(trans_df = df %>% filter(get(bufferCol)==0),
+                                    prop_id = 'bbl',
+                                    trans_id = 'rowid',
+                                    price = 'sale_price',
+                                    date= 'sale_date',
+                                    periodicity = period)
+  rf_indexwf <- rfIndex(trans_df = sales_hhdfwf,
+                          dep_var = 'price',
+                          ind_var = c('land_square_feet', 'gross_square_feet', 'flagshipParkDist',
+                                      'parkDist', 'subwayDist', 'libDistance', 'totPermits',
+                                      'HispanicLatinoPercent', 'whitePercent','blackPercent',
+                                      'BAPlusPercent', 'ownerPercent', 'median_gross_rent', 
+                                      'median_household_income_in_2019_inflation_adjusted_dollars', 
+                                      'total_units','beds', 'baths', 'sqft'),
+                          log_dep = TRUE)
+  
+  rf_indexnotwf <- rfIndex(trans_df = sales_hhdfnotwf,
+                             dep_var = 'price',
+                             ind_var =c('land_square_feet', 'gross_square_feet', 'flagshipParkDist',
+                                        'parkDist', 'subwayDist', 'libDistance', 'totPermits',
+                                        'HispanicLatinoPercent', 'whitePercent','blackPercent',
+                                        'BAPlusPercent', 'ownerPercent', 'median_gross_rent', 
+                                        'median_household_income_in_2019_inflation_adjusted_dollars',
+                                        'total_units','beds', 'baths', 'sqft'),
+                             log_dep = TRUE)
+
+list("bufferCol" = bufferCol,
+     "rf_indexwf" = rf_indexwf,
+     "rf_indexnotwf" = rf_indexnotwf)
+}
+
+dataFuncrf <- function(data, period = "yearly"){
+  if(period == "yearly"){
+    ## for year
+    bind_rows(tibble(val = data$rf_indexnotwf$index$value, type = "control",
+                     time = as.numeric(data$rf_indexnotwf$index$name)),
+              tibble(val = data$rf_indexwf$index$value, type = "treated",
+                     time = as.numeric(data$rf_indexwf$index$name))) 
+  }else {
+    bind_rows(tibble(val = data$rf_indexnotwf$index$value, type = "control",
+                     time = data$rf_indexnotwf$index$numeric),
+              tibble(val = data$rf_indexwf$index$value, type = "treated",
+                     time = data$rf_indexwf$index$numeric)) 
+  }
+}
+
+### Plot function to show hpi
+plotFunc <- function(data, treatYear, treatbuffer){
+  data %>% mutate(timeType = if_else(time <= treatYear, "before", "after"),
+                  types = paste0(type, timeType),
+                    year = lubridate::ymd(time, truncated = 2L)) %>% 
+    ggplot(aes(x = year, y = val, color = type)) + 
+    geom_line() +
+    geom_smooth(aes(group = types),
+                method = "lm", se = FALSE, lwd = 0.4, lty = 2) + 
+    geom_vline(xintercept = ymd(treatYear, truncated = 2L), lty=2) +
+      ggtitle(paste(treatbuffer,"feet -",  treatYear))+
+        theme_minimal()
+}
+
+### DND function to check difference in differences
+dndFunc <- function(data, treatyear){
+  data %>% 
+    mutate(treat = if_else(type == "treated", 1, 0),
+           year = if_else(time >= treatyear, 1, 0)) %>% 
+    lfe::felm(formula = val~time*treat | year,  data = .) %>%
+    summary(robust = TRUE)
+}
+
+## this function creates the plots with regression lines
+
+makeRegPlot <- function(df, treatYear,treatBuffer){
+    testDF <- df %>% mutate(timeType = if_else(time <= treatYear, "before", "after"),
+                                                types = paste0(type, timeType),
+                                                year = lubridate::ymd(time, truncated = 2L)) %>% 
+        bind_rows(df %>% filter(time == treatYear) %>% 
+                      mutate(timeType =   "after",
+                             types = paste0(type, timeType),
+                             year = lubridate::ymd(time, truncated = 2L)))
+    
+    outPlot <- testDF %>% ggplot(aes(x = year, y = val, group  = types, color =  type)) +
+      geom_line() +
+      geom_smooth(method = "lm",se = FALSE,  lwd = 0.4, lty = 2)+
+      geom_vline(xintercept = ymd(treatYear, truncated = 2L), lty=2) +
+      ggtitle(paste(round(treatBuffer*0.000189394,2)," Mile -",  treatYear))+
+      theme_minimal() +
+      ylab("HPI")
+    
+    outPlot
+}
+
+```
+
+```{r runHPI}
+hpiCheck <- tidyr::crossing(treatbuffer = seq(1320,3960, 660), treatYear = seq(2013, 2017))
+
+testhpi <- hpiCheck %>% 
+  mutate(data1 = purrr::map(treatbuffer, ~bufferHPI(.x, joinBuffer))) %>% 
+  #mutate(datarf = purrr::map(treatbuffer, ~bufferHPIrf(.x, joinBuffer))) %>% 
+  mutate(
+    dataClean = purrr::map(data1, ~dataFunc(.x)),
+    #dataCleanrf = purrr::map(datarf, ~dataFuncrf(.x)),
+    plot = purrr::pmap(list(dataClean,treatYear,treatbuffer), plotFunc),
+    #plotrf = purrr::pmap(list(dataCleanrf,treatYear,treatbuffer), plotFunc),
+    mod = purrr::map2(dataClean, treatYear, ~dndFunc(.x, .y)),
+    #modrf = purrr::map2(dataCleanrf, treatYear, ~dndFunc(.x, .y)),
+    coef = purrr::map_dbl(mod, ~.x$coefficients[3,1]),
+    #coefrf = purrr::map_dbl(modrf, ~.x$coefficients[3,1]),
+    pval = purrr::map_dbl(mod, ~.x$coefficients[3,4]),
+    #pvalrf = purrr::map_dbl(modrf, ~.x$coefficients[3,4]),
+    plotReg = purrr::pmap(list(dataClean, treatYear, treatbuffer), makeRegPlot)
+    )
+
+print(testhpi %>% select(treatbuffer,treatYear,coef,pval), n = 25)
+testhpi %>% select(treatbuffer,treatYear,coef,pval) %>% 
+  write_csv("data/paperTables/coefficients.csv")
+```
+
+```{r}
+testhpi %>% select(treatbuffer,treatYear,coef,pval) %>% 
+  #filter(treatbuffer > 1400) %>% 
+  knitr::kable()
+
+```
+
+diagnostics
+```{r hpiDiagnostics}
+testhpi %>% mutate(year = as.factor(treatYear)) %>% 
+  ggplot(aes(x = pval, y = coef, color = year)) +
+  geom_point() +
+  facet_wrap(~treatbuffer, scales = "free") +
+theme_minimal()
+
+```
+
+```{r}
+
+testhpi %>% filter(treatbuffer == "1320", treatYear == "2016") %>% 
+  pull(plotReg)
+
+testhpi %>% filter(treatbuffer == "1320", treatYear == "2017") %>% 
+  pull(plotrf)
+```
+
+```{r}
+testhpi %>% filter(treatbuffer == "1980", treatYear == "2016") %>% 
+  pull(plotReg)
+
+testhpi %>% filter(treatbuffer == "1980", treatYear == "2016") %>% 
+  pull(plotrf)
+```
+
+```{r}
+testhpi %>% filter(treatbuffer == "2640", treatYear == "2017") %>% 
+  pull(plotReg)
+
+testhpi %>% filter(treatbuffer == "2640", treatYear == "2016") %>% 
+  pull(plotrf)
+```
+```{r}
+testhpi %>% filter(treatbuffer == "3300", treatYear == "2015") %>% 
+  pull(plotReg)
+
+testhpi %>% filter(treatbuffer == "3300", treatYear == "2016") %>% 
+  pull(plotrf)
+```
+```{r}
+testhpi %>% filter(treatbuffer == "3960", treatYear == "2015") %>% 
+  pull(plotReg)
+
+testhpi %>% filter(treatbuffer == "3960", treatYear == "2016") %>% 
+  pull(plotrf)
+```
+
+
+```{r}
+testhpi %>% filter(treatbuffer == "1320", treatYear == "2017") %>% 
+  pull(plot)
+```
+
+```{r}
+testhpi %>% filter(treatbuffer == "4620", treatYear == "2017") %>% 
+  pull(plot)
+```
+
+```{r}
+p5 <- testhpi %>% filter(treatbuffer == "3960", treatYear == "2013") %>% 
+  pull(plotReg) %>% "[["(1)
+p4 <- testhpi %>% filter(treatbuffer == "3960", treatYear == "2014") %>% 
+  pull(plotReg) %>% "[["(1)
+p1 <- testhpi %>% filter(treatbuffer == "3960", treatYear == "2015") %>% 
+  pull(plotReg) %>% "[["(1)
+p2 <- testhpi %>% filter(treatbuffer == "3960", treatYear == "2016") %>% 
+  pull(plotReg) %>% "[["(1)
+p3 <- testhpi %>% filter(treatbuffer == "3960", treatYear == "2017") %>% 
+  pull(plotReg) %>% "[["(1)
+
+gridExtra::grid.arrange(p5, p4, p1, p2,p3, nrow = 3)
+```
+
+```{r}
+p5 <- testhpi %>% filter(treatbuffer == "3300", treatYear == "2013") %>% 
+  pull(plotReg) %>% "[["(1)
+p4 <- testhpi %>% filter(treatbuffer == "3300", treatYear == "2014") %>% 
+  pull(plotReg) %>% "[["(1)
+p1 <- testhpi %>% filter(treatbuffer == "3300", treatYear == "2015") %>% 
+  pull(plotReg) %>% "[["(1)
+p2 <- testhpi %>% filter(treatbuffer == "3300", treatYear == "2016") %>% 
+  pull(plotReg) %>% "[["(1)
+p3 <- testhpi %>% filter(treatbuffer == "3300", treatYear == "2017") %>% 
+  pull(plotReg) %>% "[["(1)
+
+gridExtra::grid.arrange(p5, p4, p1, p2,p3, nrow = 3)
+```
+
+```{r}
+p5 <- testhpi %>% filter(treatbuffer == "1320", treatYear == "2013") %>% 
+  pull(plotReg) %>% "[["(1)
+p4 <- testhpi %>% filter(treatbuffer == "1320", treatYear == "2014") %>% 
+  pull(plotReg) %>% "[["(1)
+p1 <- testhpi %>% filter(treatbuffer == "1320", treatYear == "2015") %>% 
+  pull(plotReg) %>% "[["(1)
+p2 <- testhpi %>% filter(treatbuffer == "1320", treatYear == "2016") %>% 
+  pull(plotReg) %>% "[["(1)
+p3 <- testhpi %>% filter(treatbuffer == "1320", treatYear == "2017") %>% 
+  pull(plotReg) %>% "[["(1)
+
+gridExtra::grid.arrange(p5, p4, p1, p2,p3, nrow = 3)
+```
+
+```{r}
+p5 <- testhpi %>% filter(treatbuffer == "2640", treatYear == "2013") %>% 
+  pull(plotReg) %>% "[["(1)
+p4 <- testhpi %>% filter(treatbuffer == "2640", treatYear == "2014") %>% 
+  pull(plotReg) %>% "[["(1)
+p1 <- testhpi %>% filter(treatbuffer == "2640", treatYear == "2015") %>% 
+  pull(plotReg) %>% "[["(1)
+p2 <- testhpi %>% filter(treatbuffer == "2640", treatYear == "2016") %>% 
+  pull(plotReg) %>% "[["(1)
+p3 <- testhpi %>% filter(treatbuffer == "2640", treatYear == "2017") %>% 
+  pull(plotReg) %>% "[["(1)
+
+gridExtra::grid.arrange(p5, p4, p1, p2,p3, nrow = 3)
+```
+
+### Permits
+
+get permits data
+
+```{r permitData}
+permits <- readr::read_csv(file.path(dataDir, "DOB_Permit_Issuance2010_2020.csv")) %>% 
+    janitor::clean_names()
+
+permits <- permits %>% 
+    select(borough, job_type,
+           block, lot, permit_type,
+           filing_date, latitude, longitude) %>% 
+    mutate(filing_date = lubridate::mdy_hms(filing_date),
+           year = lubridate::year(filing_date),
+           month = lubridate::month(filing_date))
+
+MNpermits <- permits %>% filter(!is.na(latitude), borough == "MANHATTAN") %>% 
+    sf::st_as_sf(coords = c("longitude", "latitude")) %>% 
+    sf::st_set_crs(4326) %>% 
+    sf::st_transform(2263)
+
+permitJoin <- MNpermits  %>% sf::st_join(wfHarlemBufferOne) %>% 
+    filter(!is.na(store))
+
+permitBuffer <- permitJoin %>% sf::st_join(wfHarlemBufferHalf %>% mutate(buffer = "half") %>% select(buffer)) %>% 
+    mutate(buffer = if_else(is.na(buffer), "mile", buffer))
+```
+
+visualize permits around WF
+
+```{r permitViz}
+permitBuffer %>% 
+    sf::st_drop_geometry() %>% 
+    group_by(month, year, buffer) %>% 
+    rename(date = filing_date) %>% 
+    summarize(count = n(),
+              date = min(date)) %>% 
+    ggplot(aes(date, count, group = buffer)) +
+    geom_line(aes(color = buffer))+ 
+    geom_vline(xintercept = as.POSIXct("2017-07-21"),
+               linetype="dotted", 
+               color = "blue", size=0.5) + 
+    geom_smooth(size = 0.5) +
+    theme_minimal() + 
+    ggtitle("Building Permits near Whole Foods Harlem")
+```
+
+```{r}
+  tm_shape(permitJoin) +
+  tm_dots(size = 0.1, alpha = 0.1, jitter = 0.15)+
+  tm_shape(wf %>% filter(store == "Whole Foods Harlem"))+
+  tm_symbols(col = "red") +
+  tm_layout()
+
+```
+
+permit dnd functions
+```{r petmitFunctions}
+bufferData <- function(treatBuffer, treatYear){
+    wfHarlemBuffer <- wfHarlem %>% sf::st_buffer(treatBuffer) 
+    permitBuffer <- permitJoin %>% sf::st_join(wfHarlemBuffer %>% mutate(buffer = 1) %>% select(buffer)) %>% 
+        mutate(buffer = if_else(is.na(buffer),  0, buffer))
+    
+    modDF <- permitBuffer %>% 
+        sf::st_drop_geometry() %>% 
+        group_by(month, year, buffer) %>% 
+        rename(date = filing_date) %>% 
+        summarize(count = n(),
+                  date = min(date)) %>% 
+        mutate(time = if_else(year <=treatYear, 0,1)) %>% 
+        rename(treatment = buffer) %>% 
+        mutate(time = as.factor(time),
+               treatment = as.factor(treatment))
+}
+
+plotBuffer <- function(bufferData, year){
+    bufferData %>% 
+        ggplot(aes(date, count, group = treatment)) +
+        geom_line(aes(color = treatment))+ 
+        geom_vline(xintercept = as.POSIXct(paste0(year,"-07-21")),
+                   linetype="dotted", 
+                   color = "blue", size=0.5) + 
+        geom_smooth(size = 0.5) +
+        theme_minimal() + 
+        ggtitle("Building Permits near Whole Foods Harlem")
+}
+    
+modFunc <- function(modDF){
+    mod1 <- lm(count~time*treatment, modDF)
+}
+
+coefFunc <- function(mod){
+    mod$coefficients[4]
+}
+
+pvalFunc <- function(mod){
+    summary(mod)$coefficients[4,4]
+}
+
+```
+
+```{r permitModel}
+permitDist <- tidyr::crossing(treatbuffer = seq(1320,4620, 660), treatYear = seq(2015, 2018))
+
+permitDND <- permitDist %>% 
+    mutate(modDF = purrr::map2(treatbuffer, treatYear, ~bufferData(.x,.y)),
+           plots = purrr::map2(modDF, treatYear, ~plotBuffer(.x,.y)),
+           mods = purrr::map(modDF, ~modFunc(.x)),
+           coef = purrr::map_dbl(mods, ~coefFunc(.x)),
+           pval = purrr::map_dbl(mods, ~pvalFunc(.x)))
+```
+
+```{r permitDiagnoistics}
+permitDND$plots[[1]]
+
+permitDND %>% 
+    ggplot(aes(x = pval, y = coef, color = as.factor(treatYear))) +
+    geom_point() +
+    facet_wrap(~treatbuffer)
+```
+
+```{r}
+print(permitDND, n = 24)
+
+permitDND %>%mutate(year = as.factor(treatYear)) %>% 
+  ggplot(aes(x = pval, y = coef, color = year)) +
+  geom_point() +
+  facet_wrap(~treatbuffer, scales = "free") +
+theme_minimal()
+```
+
+```{r}
+permitDND %>% filter(treatbuffer == "1980", treatYear == "2017") %>% 
+  pull(plots)
+```
+
+
+## digging in 1980 feet
+
+```{r}
+
+wfBuffer <- wfHarlem %>% sf::st_buffer(1980)
+
+plutoSubset1 <- pluto %>% 
+  filter(BoroName == "Manhattan") %>% 
+  filter(!Block %in% c(1111, 1897)) %>% 
+  sf::st_join(wfBuffer, join =sf::st_within) %>%  
+  dplyr::mutate(buffer = if_else(store == "Whole Foods Harlem", "Half", "Not")) %>% 
+  select(-store) %>% 
+  sf::st_join(wfHarlemBufferOne, join =sf::st_within) %>%  
+  dplyr::mutate(bufferMile = if_else(store == "Whole Foods Harlem", "Mile", "Not")) %>% 
+  filter(!is.na(bufferMile)) %>% 
+  mutate(buffer = if_else(is.na(buffer), bufferMile, buffer)) %>% 
+  rename(block = Block)
+
+wfDF <- mnSalesFinal %>% 
+  left_join(plutoSubset1 %>% st_drop_geometry() %>% select(block, buffer)) %>%  filter(buffer == "Half")
+notwfDF <- mnSalesFinal %>% 
+  left_join(plutoSubset1 %>% st_drop_geometry() %>% select(block, buffer)) %>% filter(buffer == "Mile")
+
+```
+
+
+
+```{r}
+mnSalesFinal %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE)) %>% 
+  left_join(permitJoin %>% 
+  st_drop_geometry() %>% 
+  group_by(year) %>% 
+  count(name = "permits"))
+```
+
+
+```{r}
+wfDFStats <- wfDF %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n())
+
+notwfDFStats <- notwfDF %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n())
+```
+
+```{r}
+wfDFStats %>% 
+  select(-c(count)) %>% 
+  tidyr::pivot_longer(-year) %>% mutate(treatment = "WF") %>% 
+  bind_rows(notwfDFStats %>% 
+  select(-count) %>% 
+  tidyr::pivot_longer(-year) %>% mutate(treatment = "notWF")) %>% 
+  ggplot(aes(x=year, y = value)) +
+  geom_line(aes(color = treatment)) + 
+  facet_wrap(~name, scales = "free_y") + 
+  theme_minimal()
+
+```
+
+```{r}
+buffers <- seq(1320,4620, 660)
+
+bufferFunc <- function(buffer){
+  # create buffer
+  wfBuffer <- wfHarlem %>% sf::st_buffer(buffer) %>% 
+    mutate(dist = buffer)
+  plutoSubset1 <- plutoWF %>% 
+  filter(!Block %in% c(1111, 1897)) %>% 
+  sf::st_join(wfBuffer, join =sf::st_within) %>% 
+    st_drop_geometry() %>% 
+    select(dist)
+}
+
+testDF <- map_dfc(buffers, ~bufferFunc(.x))
+names(testDF) <- paste0("dist",buffers)
+plutoWFBuffers <- plutoWF %>%bind_cols(testDF)
+
+```
+
+```{r}
+tm_shape(plutoWFBuffers %>% filter(is.na(dist1320), !is.na(dist1980))) + tm_polygons()
+tm_shape(plutoWFBuffers %>% filter(is.na(dist1980), !is.na(dist2640))) + tm_polygons()
+tm_shape(plutoWFBuffers %>% filter( !is.na(dist1320))) + tm_polygons()
+
+```
+
+just 1320
+```{r}
+d1320 <- mnSalesFinal %>% 
+  left_join(plutoWFBuffers %>% filter(!is.na(dist1320)) %>% 
+              st_drop_geometry() %>% 
+              select(Block, dist1320), by = c("block"="Block")) %>% 
+  filter(!is.na(dist1320)) %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n(),
+            buffer = "1320")
+```
+
+just 1980 buffer
+```{r}
+d1980 <- mnSalesFinal %>% 
+  left_join(plutoWFBuffers %>% filter(is.na(dist1320), !is.na(dist1980)) %>% 
+              st_drop_geometry() %>% 
+              select(Block, dist1980), by = c("block"="Block")) %>% 
+  filter(!is.na(dist1980)) %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n(),
+            buffer = "1980")
+```
+
+
+just dist2640 buffer
+```{r}
+d2640 <- mnSalesFinal %>% 
+  left_join(plutoWFBuffers %>% filter(is.na(dist1980), !is.na(dist2640)) %>% 
+              st_drop_geometry() %>% 
+              select(Block, dist2640), by = c("block"="Block")) %>% 
+  filter(!is.na(dist2640)) %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n(),
+            buffer = "2640")
+```
+
+just dist3300 buffer
+```{r}
+d3300 <- mnSalesFinal %>% 
+  left_join(plutoWFBuffers %>% filter(is.na(dist2640), !is.na(dist3300)) %>% 
+              st_drop_geometry() %>% 
+              select(Block, dist3300), by = c("block"="Block")) %>% 
+  filter(!is.na(dist3300)) %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n(),
+            buffer = "3300")
+```
+just dist3960 buffer
+```{r}
+d3960 <- mnSalesFinal %>% 
+  left_join(plutoWFBuffers %>% filter(is.na(dist3300), !is.na(dist3960)) %>% 
+              st_drop_geometry() %>% 
+              select(Block, dist3960), by = c("block"="Block")) %>% 
+  filter(!is.na(dist3960)) %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n(),
+            buffer = "3960")
+```
+just dist4620 buffer
+```{r}
+d4620 <- mnSalesFinal %>% 
+  left_join(plutoWFBuffers %>% filter(is.na(dist3960), !is.na(dist4620)) %>% 
+              st_drop_geometry() %>% 
+              select(Block, dist4620), by = c("block"="Block")) %>% 
+  filter(!is.na(dist4620)) %>% 
+  mutate(year = lubridate::year(sale_date)) %>% 
+  group_by(year) %>% 
+  summarize(avgPrice = mean(sale_price, na.rm = TRUE),
+            medPrice = median(sale_price, na.rm = TRUE),
+            minPrice = min(sale_price, na.rm = TRUE),
+            maxPrice = max(sale_price, na.rm = TRUE),
+            count = n(),
+            buffer = "4620")
+```
+```{r}
+combBuffer <- d1320 %>% 
+  bind_rows(d1980) %>% 
+  bind_rows(d2640) %>% 
+  bind_rows(d3300) %>% 
+  bind_rows(d3960) %>% 
+  bind_rows(d4620)
+```
+
+```{r}
+combBuffer %>% 
+  tidyr::pivot_longer(-c(year, buffer)) %>% 
+  ggplot(aes(x = year, y = value)) + 
+  geom_line(aes(color = buffer)) +
+  facet_wrap(~name, scales = "free_y") +
+  theme_minimal()
+  
+```
+
+## Equations
+
+$$ \tau$$
+
+$$ln(p^t_i) = \alpha + \sum_{k=1}^{K} \beta_k z_{i,k}^t +\sum_{t=1}^{T} \sigma_\tau d_{i,\tau}^t  + \varepsilon_i^t,
+\qquad i=1,\ldots, N,\quad t=1,\ldots ,T$$
+
+
+## Median house prices
+
+```{r}
+wfHarlemBuffer2640 <- wfHarlem %>% sf::st_buffer(2640)
+
+plutoWF2640 <- pluto %>% filter(sf::st_intersects(pluto, wfHarlemBuffer2640,sparse = FALSE)) %>% 
+  select(BoroName, Block) %>% 
+  group_by(Block) %>% 
+  summarize(BoroName = first(BoroName)) %>% 
+  sf::st_cast() %>% 
+  ungroup() %>% 
+  filter(!Block %in% c(1111, 1897)) %>% 
+  sf::st_join(wfHarlemBuffer2640 %>% mutate(buffer = "treated"),join =sf::st_within) %>%  
+  dplyr::mutate(buffer = if_else(is.na(buffer), "control", buffer))
+
+mnSalesJoin2640 <- readr::read_csv(file.path(dataDir, "modelling/allSalesForModel.csv")) %>% 
+    mutate(rowid = row_number()) %>% 
+    filter(sale_price > 50000, sale_price < 10000000,
+           tax_class_at_time_of_sale %in% c(1,2),
+           str_starts(building_class_at_present, "A|B|C|D|R|S")) %>% 
+  left_join(plutoWF2640 %>% sf::st_drop_geometry() %>% 
+              select(Block, buffer) %>% 
+              rename(block = Block)) %>% 
+  mutate(buffer = if_else(is.na(buffer), "control", buffer))
+
+mnSalesFinal2640 <- mnSalesJoin2640 %>% left_join(newDF2, by = c("block" = "block", "lot" = "lot", "sale_price" = "sale_price",
+                                        "sale_date" = "sale_date"))
+
+mnSalesFinal2640 %>% mutate(year = year(sale_date)) %>% 
+  group_by(year, buffer) %>% 
+  summarize(medPrice = median(sale_price)) %>% 
+  tidyr::pivot_wider(names_from = buffer, values_from = medPrice) %>% 
+  write_csv(., file = "data/paperTables/medPriceByYear.csv")
+
+mnSalesFinal2640 %>% mutate(year = year(sale_date)) %>% 
+  group_by(year, buffer) %>% 
+  count()
+
+mnSalesFinal2640 %>% 
+  group_by(buffer) %>% 
+  summarize(medianPrice = median(sale_price)) %>% 
+  write_csv(., file = "data/paperTables/medPriceByBuffer.csv")
+```
+
+## stats table
+
+```{r}
+mnSalesFinal %>% 
+  summarize(avg_parkDist = mean(parkDist, na.rm=TRUE),
+            min_parkDist = min(parkDist, na.rm=TRUE),
+            max_parkDist = max(parkDist,na.rm = TRUE),
+            avg_libDistance = mean(libDistance, na.rm=TRUE),
+            min_libDistance = min(libDistance, na.rm=TRUE),
+            max_libDistance = max(libDistance,na.rm = TRUE),
+            avg_subwayDist = mean(subwayDist, na.rm=TRUE),
+            min_subwayDist = min(subwayDist, na.rm=TRUE),
+            max_subwayDist = max(subwayDist,na.rm = TRUE),
+            avg_blackPercent = mean(blackPercent, na.rm=TRUE),
+            min_blackPercent = min(blackPercent, na.rm=TRUE),
+            max_blackPercent = max(blackPercent,na.rm = TRUE),
+            avg_bachelorsPlus = mean(BAPlusPercent, na.rm=TRUE),
+            min_bachelorsPlus = min(BAPlusPercent, na.rm=TRUE),
+            max_bachelorsPlus = max(BAPlusPercent,na.rm = TRUE),
+            avg_HispanicLatinoPercent = mean(HispanicLatinoPercent, na.rm=TRUE),
+            min_HispanicLatinoPercent = min(HispanicLatinoPercent, na.rm=TRUE),
+            max_HispanicLatinoPercent = max(HispanicLatinoPercent,na.rm = TRUE),
+            avg_ownerPercent = mean(ownerPercent, na.rm=TRUE),
+            min_ownerPercent = min(ownerPercent, na.rm=TRUE),
+            max_ownerPercent = max(ownerPercent,na.rm = TRUE),
+            avg_mediangrossrent = mean(median_gross_rent, na.rm=TRUE),
+            min_mediangrossrent = min(median_gross_rent, na.rm=TRUE),
+            max_mediangrossrent = max(median_gross_rent,na.rm = TRUE),
+            avg_medianhouseholdIncome = mean(median_household_income_in_2019_inflation_adjusted_dollars, na.rm=TRUE),
+            min_medianhouseholdIncome = min(median_household_income_in_2019_inflation_adjusted_dollars, na.rm=TRUE),
+            max_medianhouseholdIncome = max(median_household_income_in_2019_inflation_adjusted_dollars,na.rm = TRUE),
+                        avg_averageHouseholdSize = mean(average_household_size, na.rm=TRUE),
+            min_averageHouseholdSize = min(average_household_size, na.rm=TRUE),
+            max_averageHouseholdSize = max(average_household_size,na.rm = TRUE),
+                        avg_beds = mean(beds, na.rm=TRUE),
+            min_beds = min(beds, na.rm=TRUE),
+            max_beds = max(beds,na.rm = TRUE),
+                        avg_baths = mean(baths, na.rm=TRUE),
+            min_baths = min(baths, na.rm=TRUE),
+            max_baths = max(baths,na.rm = TRUE),
+                        avg_sqft = mean(sqft, na.rm=TRUE),
+            min_sqft = min(sqft, na.rm=TRUE),
+            max_sqft = max(sqft,na.rm = TRUE)) %>% 
+  tidyr::pivot_longer(cols = everything() ) %>% 
+  tidyr::separate(col = name, into = c("type", "variable"), sep = "_") %>% 
+  tidyr::pivot_wider(names_from = type, values_from = value) %>% write_csv("data/paperTables/predictorStats.csv")
+```
+
+## caceres
+```{r}
+modSimple  <- joinBuffer %>% 
+  mutate(date =  ymd(sale_date),
+         year  =  year(date),
+         treatYear = if_else(year < 2017, 0, 1)) %>% 
+lm(formula = log(sale_price)  ~ flagshipParkDist + parkDist  +subwayDist+ libDistance + totPermits+
+     HispanicLatinoPercent + blackPercent +  BAPlusPercent+ ownerPercent  + median_gross_rent + 
+     median_household_income_in_2019_inflation_adjusted_dollars + total_units  +
+     beds  +  baths  + sqft  + buffer_2640*treatYear)
+
+summary(modSimple)
+```
+
+
+## radius
+
+```{r}
+st_buffer(wfHarlem %>% st_transform(2263), 1280) %>% st_transform(4326)
+leaflet() %>% 
+    addTiles() %>% 
+    addCircleMarkers(data = wf) %>% 
+    addPolygons(data = st_buffer(wf %>% st_transform(2263), 1320) %>% st_transform(4326),
+                fill = NA)%>% 
+    addPolygons(data = st_buffer(wf %>% st_transform(2263), 1980) %>% st_transform(4326),
+                fill = NA) %>% 
+    addPolygons(data = st_buffer(wf %>% st_transform(2263), 2640) %>% st_transform(4326),
+                fill = NA) %>% 
+    addPolygons(data = st_buffer(wf %>% st_transform(2263), 3300) %>% st_transform(4326),
+                fill = NA)%>% 
+    addPolygons(data = st_buffer(wf %>% st_transform(2263), 3960) %>% st_transform(4326),
+                fill = NA)
+
+st_buffer(wf, 1280)
+```
+
